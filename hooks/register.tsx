@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { PastedImage } from '../types'
-import { fitRow, imageNumbers, pngSize } from './layout'
+import { REMOVE_LABEL, fitRow, footer, imageNumbers, pngSize, withoutImage } from './layout'
 import type { Size } from './layout'
 
 // Pasting an image raises no prompt.edit (the tag only shows up on the next keystroke),
@@ -18,8 +18,8 @@ let found: { sessionId: string; dir: string } | undefined
 let shownKey: string | undefined
 let isChecking = false
 const sizes = new Map<string, Size | null>()
-// Source files sips couldn't convert, so a broken paste isn't retried on every poll.
-const unconvertible = new Set<string>()
+// Each cached paste's preview PNG (null when none could be made), so a paste is processed once.
+const previews = new Map<string, string | null>()
 
 // Claude Code caches each paste as <tmp>/<project>/<session>/images/<n>.png. The project
 // folder is named after a working directory that may since have moved, so find it by the
@@ -42,25 +42,38 @@ async function imagesDir($: EngineInterface): Promise<string | undefined> {
   return undefined
 }
 
-// Pastes are cached as <n>.png or <n>.webp (or another format), but the terminal only
-// decodes PNG, so anything else is converted once to <session>/image-view-<n>.png.
-// sips ships with macOS only, so on Linux a non-PNG paste still shows "no preview".
-async function pngFor($: EngineInterface, dir: string, n: number): Promise<string | undefined> {
-  const png = `${dir}/${n}.png`
-  if (await $.fs.exists(png)) return png
-  const out = `${dir.replace(/\/images$/, '')}/image-view-${n}.png`
+async function run($: EngineInterface, argv: readonly string[]): Promise<boolean> {
+  const { exitCode } = await $.process.run(argv).catch(() => ({ exitCode: 1 }))
+  return exitCode === 0
+}
+
+// Pastes are cached as <n>.png, <n>.webp, <n>.heic and so on, and the terminal only draws PNG.
+// Every paste gets a preview: sips converts it to an 800px PNG, then ffmpeg adds a transparent
+// strip down each side, PADDING of the height wide. The frame's side lines sit half a column
+// from the picture but the top and bottom lines half a row, about twice that; the strip evens
+// them out (exactly at the 6-row tile, close when tiles shrink).
+// sips ships with macOS only; without ffmpeg the preview is drawn unpadded.
+const PADDING = 'trunc(ih/24)'
+async function makePreview($: EngineInterface, source: string, base: string, n: number): Promise<string | null> {
+  const raw = `${base}/image-preview-${n}.raw.png`
+  const out = `${base}/image-preview-${n}.png`
   if (await $.fs.exists(out)) return out
+  if (!(await run($, ['sips', '-s', 'format', 'png', '-Z', '800', source, '--out', raw]))) {
+    return source.endsWith('.png') ? source : null
+  }
+  const pad = `format=rgba,pad=iw+2*${PADDING}:ih:${PADDING}:0:color=black@0`
+  return (await run($, ['ffmpeg', '-v', 'error', '-y', '-i', raw, '-vf', pad, '-frames:v', '1', out])) ? out : raw
+}
+
+async function pngFor($: EngineInterface, dir: string, n: number): Promise<string | undefined> {
   const entries = await $.fs.list(dir).catch(() => [])
   const source = entries.find(entry => entry.kind === 'file' && entry.name.startsWith(`${n}.`))
   if (source === undefined) return undefined
   const sourcePath = `${dir}/${source.name}`
-  if (unconvertible.has(sourcePath)) return undefined
-  const { exitCode } = await $.process
-    .run(['sips', '-s', 'format', 'png', '-Z', '800', sourcePath, '--out', out])
-    .catch(() => ({ exitCode: 1 }))
-  if (exitCode === 0) return out
-  unconvertible.add(sourcePath)
-  return undefined
+  if (!previews.has(sourcePath)) {
+    previews.set(sourcePath, await makePreview($, sourcePath, dir.replace(/\/images$/, ''), n))
+  }
+  return previews.get(sourcePath) ?? undefined
 }
 
 async function describe($: EngineInterface, dir: string | undefined, n: number): Promise<PastedImage> {
@@ -88,6 +101,13 @@ async function show($: EngineInterface, draft: string) {
   await update($, images, () => list)
 }
 
+// The [×] on a tile: take the image's tag out of the draft, then redraw without waiting for the poll.
+async function remove($: EngineInterface, n: number) {
+  const text = withoutImage((await $.prompt.read()).text, n)
+  await $.prompt.fill({ text, mode: 'replace' })
+  await show($, text)
+}
+
 async function check($: EngineInterface) {
   if (isChecking) return
   isChecking = true
@@ -109,8 +129,10 @@ export const register: Register = on => {
     const list = await read($, images)
     if (list.length === 0) return next(e)
 
-    const { Box, Image, Text } = $.ui.resolve(e)
+    const { Box, Button, Image, Text } = $.ui.resolve(e)
     const cells = fitRow(list.map(image => image.size), e.props.maxRows, e.props.bodyColumns)
+    // The main screen sends no clicks, so the [×] only shows where it can be clicked.
+    const canClick = e.viewport?.isFullscreen === true
     const below = await next(e)
 
     return (
@@ -118,22 +140,40 @@ export const register: Register = on => {
         <Box flexDirection="row" columnGap={1}>
           {list.map((image, i) => {
             const { columns, rows } = cells[i] ?? { columns: 4, rows: 1 }
+            // The frame is drawn by hand so the number and [×] can sit in its bottom edge. The
+            // sides stay centred │ so they join the rounded corners; the preview's transparent
+            // side strips, not the frame, even out the gap around the picture.
+            const side = (bar: string) => Array.from({ length: rows }, () => bar).join('\n')
+            const { head, tail } = footer(image.n, columns, canClick)
             return (
-              <Box flexDirection="column" alignItems="center" borderStyle="round" borderDimColor>
-                {image.path === null ? (
-                  <Box width={columns} height={rows} alignItems="center" justifyContent="center">
-                    <Text dimColor wrap="truncate">no preview</Text>
-                  </Box>
-                ) : (
-                  <Image
-                    key={`image-${image.n}`}
-                    source={{ file: image.path, format: 'png' }}
-                    columns={columns}
-                    rows={rows}
-                    alt={`[Image #${image.n}]`}
-                  />
-                )}
-                <Text dimColor>#{image.n}</Text>
+              <Box flexDirection="column">
+                <Text dimColor>{`╭${'─'.repeat(columns)}╮`}</Text>
+                <Box flexDirection="row">
+                  <Text dimColor>{side('│')}</Text>
+                  {image.path === null ? (
+                    <Box width={columns} height={rows} alignItems="center" justifyContent="center">
+                      <Text dimColor wrap="truncate">no preview</Text>
+                    </Box>
+                  ) : (
+                    <Image
+                      key={`image-${image.n}`}
+                      source={{ file: image.path, format: 'png' }}
+                      columns={columns}
+                      rows={rows}
+                      alt={`[Image #${image.n}]`}
+                    />
+                  )}
+                  <Text dimColor>{side('│')}</Text>
+                </Box>
+                <Box flexDirection="row">
+                  <Text dimColor>{head}</Text>
+                  {canClick && (
+                    <Button key={`remove-${image.n}`} plain dimColor onPress={() => remove($, image.n)}>
+                      {REMOVE_LABEL}
+                    </Button>
+                  )}
+                  <Text dimColor>{tail}</Text>
+                </Box>
               </Box>
             )
           })}
