@@ -45,7 +45,7 @@ Paste one or more images and a row of thumbnails sits above the prompt, each lab
 ```
 
 - **Thumbnails appear as soon as you paste.** You don't have to type another key first.
-- **Thumbnails keep their shape.** Wide screenshots stay wide and phone shots stay tall.
+- **Thumbnails keep their shape.** Wide screenshots stay wide and phone shots stay tall, and tiles of different heights share a bottom edge so their labels line up.
 - **Even breathing room.** The picture sits the same distance from every edge of its frame.
 - **Click `[×]` to drop an image.** It takes that `[Image #n]` tag out of the prompt. Clicks only reach Claude Code in fullscreen (`/tui fullscreen`), so the `[×]` only shows there; on the main screen the border reads `╰─ #1 ──────╯`.
 - **Always fits on screen.** Tiles shrink to fit the space above the prompt, so the row never scrolls or gets cut off.

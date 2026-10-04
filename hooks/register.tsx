@@ -137,7 +137,8 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column">
-        <Box flexDirection="row" columnGap={1}>
+        {/* Tiles of different heights share a bottom edge, so their labels line up above the prompt. */}
+        <Box flexDirection="row" columnGap={1} alignItems="flex-end">
           {list.map((image, i) => {
             const { columns, rows } = cells[i] ?? { columns: 4, rows: 1 }
             // The frame is drawn by hand so the number and [×] can sit in its bottom edge. The
